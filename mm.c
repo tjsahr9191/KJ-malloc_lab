@@ -82,15 +82,17 @@ static char *free_listp;
 
 static char *heap_listp;
 
-static void *coalesce_for_first_fit(void *bp);
+static char *next_fit_p = NULL;
+
+static void *coalesce_for_next_fit(void *bp);
 
 static void *extend_heap(size_t words);
 
 static void *find_fit(size_t asize, fit_policy_t fit_policy);
 
-static void *first_fit(size_t asize);
+static void *next_fit(size_t asize);
 
-static void place_for_first_fit(void *bp, size_t asize);
+static void place_for_next_fit(void *bp, size_t asize);
 
 static void list_add(void *bp);
 
@@ -136,8 +138,8 @@ void *mm_malloc(size_t size) {
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
 
     /* Search the free list for a fit */
-    if ((bp = find_fit(asize, first_fit)) != NULL) {
-        place_for_first_fit(bp, asize);
+    if ((bp = find_fit(asize, next_fit)) != NULL) {
+        place_for_next_fit(bp, asize);
         return bp;
     }
 
@@ -145,7 +147,7 @@ void *mm_malloc(size_t size) {
     extendsize = MAX(asize, CHUNKSIZE);
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
-    place_for_first_fit(bp, asize);
+    place_for_next_fit(bp, asize);
     return bp;
 }
 
@@ -157,7 +159,7 @@ void mm_free(void *bp) {
 
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
-    coalesce_for_first_fit(bp);
+    coalesce_for_next_fit(bp);
 }
 
 /*
@@ -196,7 +198,7 @@ static void *extend_heap(size_t words) {
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */
 
     /* Coalesce if the previous block was free */
-    return coalesce_for_first_fit(bp);
+    return coalesce_for_next_fit(bp);
 }
 
 static void list_add(void *bp) {
@@ -226,10 +228,13 @@ static void list_remove(void *bp) {
     }
 }
 
-static void *coalesce_for_first_fit(void *bp) {
+static void *coalesce_for_next_fit(void *bp) {
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
+
+    void *orig_bp = bp;
+    void *next_bp = NEXT_BLKP(bp);
 
     if (prev_alloc && next_alloc) {
         /* Case 1 */
@@ -257,38 +262,71 @@ static void *coalesce_for_first_fit(void *bp) {
         bp = PREV_BLKP(bp);
     }
 
+    if ((next_fit_p != NULL) && (next_fit_p == orig_bp || next_fit_p == next_bp)) {
+        next_fit_p = bp;
+    }
+
     list_add(bp);
     return bp;
 }
 
-static void *first_fit(size_t asize) {
+static void *next_fit(size_t asize) {
     void *bp;
+    char *start_p;
 
-    for (bp = free_listp; bp != NULL; bp = SUCCP(bp)){
+    if (next_fit_p == NULL) {
+        next_fit_p = free_listp;
+    }
+    start_p = next_fit_p;
+
+    for (bp = start_p; bp != NULL; bp = SUCCP(bp)) {
         if (asize <= GET_SIZE(HDRP(bp))) {
             return bp;
         }
     }
-    return NULL;
+
+    for (bp = free_listp; bp != start_p; bp = SUCCP(bp)) {
+        if (asize <= GET_SIZE(HDRP(bp))) {
+            return bp; // 블록을 찾음
+        }
+    }
+
+    return NULL; // 힙 전체를 탐색해도 적합한 블록이 없음
 }
 
 static void *find_fit(size_t asize, fit_policy_t fit_policy) {
     return fit_policy(asize);
 }
 
-static void place_for_first_fit(void *bp, size_t asize) {
+static void place_for_next_fit(void *bp, size_t asize) {
     size_t csize = GET_SIZE(HDRP(bp));
-    list_remove(bp);
+
+    // [수정 1] bp를 제거하기 전에 다음 가용 블록(successor)을 저장
+    void *succ_bp = SUCCP(bp);
+
+    list_remove(bp); // 가용 리스트에서 제거
 
     if ((csize - asize) >= (2 * DSIZE)) {
+        // [Case 1: 블록 분할]
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(csize-asize, 0));
-        PUT(FTRP(bp), PACK(csize-asize, 0));
-        list_add(bp);
+
+        void *next_bp = NEXT_BLKP(bp);
+        PUT(HDRP(next_bp), PACK(csize-asize, 0));
+        PUT(FTRP(next_bp), PACK(csize-asize, 0));
+        list_add(next_bp);
+
+        // 다음 탐색은 새로 생긴 가용 블록(next_bp)부터 시작
+        next_fit_p = next_bp;
+
     } else {
+        // [Case 2: 분할 없음]
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
+
+        // [수정 2] 다음 탐색을 메모리상 다음 블록(X)이 아닌,
+        // 가용 리스트의 다음 블록(succ_bp)부터 시작
+        // 만약 succ_bp가 NULL (꼬리)이었다면, 리스트의 처음으로 보냄
+        next_fit_p = (succ_bp != NULL) ? succ_bp : free_listp;
     }
 }
