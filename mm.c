@@ -70,19 +70,21 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
-typedef void* (*fit_policy_t)(size_t asize);
+typedef void * (*fit_policy_t)(size_t asize);
 
 static char *heap_listp;
 
-static void *coalesce(void *bp);
+static char *next_fit_p = NULL;
+
+static void *coalesce_for_next_fit(void *bp);
 
 static void *extend_heap(size_t words);
 
 static void *find_fit(size_t asize, fit_policy_t fit_policy);
 
-static void * first_fit(size_t asize);
+static void *next_fit(size_t asize);
 
-static void place(void *bp, size_t asize);
+static void place_for_next_fit(void *bp, size_t asize);
 
 /*
  * mm_init - initialize the malloc package.
@@ -123,8 +125,8 @@ void *mm_malloc(size_t size) {
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
 
     /* Search the free list for a fit */
-    if ((bp = find_fit(asize, first_fit)) != NULL) {
-        place(bp, asize);
+    if ((bp = find_fit(asize, next_fit)) != NULL) {
+        place_for_next_fit(bp, asize);
         return bp;
     }
 
@@ -132,7 +134,7 @@ void *mm_malloc(size_t size) {
     extendsize = MAX(asize, CHUNKSIZE);
     if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
-    place(bp, asize);
+    place_for_next_fit(bp, asize);
     return bp;
 }
 
@@ -144,7 +146,7 @@ void mm_free(void *bp) {
 
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
-    coalesce(bp);
+    coalesce_for_next_fit(bp);
 }
 
 /*
@@ -182,67 +184,93 @@ static void *extend_heap(size_t words) {
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */
 
     /* Coalesce if the previous block was free */
-    return coalesce(bp);
+    return coalesce_for_next_fit(bp);
 }
 
-static void *coalesce(void *bp) {
+static void *coalesce_for_next_fit(void *bp) {
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
+    void *orig_bp = bp;
+    void *next_bp = NEXT_BLKP(bp);
+
     if (prev_alloc && next_alloc) {
         /* Case 1 */
-        return bp;
+        // bp는 변경되지 않음
     }
-
-    if (prev_alloc && !next_alloc) {
-        /* Case 2 */
+    else if (prev_alloc && !next_alloc) {
+        /* Case 2: 다음 블록과 병합 */
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
-    } else if (!prev_alloc && next_alloc) {
-        /* Case 3 */
+    }
+    else if (!prev_alloc && next_alloc) {
+        /* Case 3: 이전 블록과 병합 */
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(FTRP(bp), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
-    } else {
-        /* Case 4 */
+    }
+    else {
+        /* Case 4: 양쪽 블록과 병합 */
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) +
                 GET_SIZE(FTRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
-    return bp;
+
+    if ((next_fit_p != NULL) && (next_fit_p == orig_bp || next_fit_p == next_bp)) {
+        next_fit_p = bp;
+    }
+
+    return bp; // 새로 병합된 블록의 포인터 반환
 }
 
-static void * first_fit(size_t asize) {
+static void *next_fit(size_t asize) {
     void *bp;
+    char *start_p;
 
-    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
+    if (next_fit_p == NULL) {
+        next_fit_p = heap_listp;
+    }
+    start_p = next_fit_p;
+
+    for (bp = start_p; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {
         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
             return bp;
         }
     }
-    return NULL;
+
+    for (bp = heap_listp; bp < start_p; bp = NEXT_BLKP(bp)) {
+        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
+            return bp; // 블록을 찾음
+        }
+    }
+
+    return NULL; // 힙 전체를 탐색해도 적합한 블록이 없음
 }
 
 static void *find_fit(size_t asize, fit_policy_t fit_policy) {
     return fit_policy(asize);
 }
 
-static void place(void *bp, size_t asize) {
+static void place_for_next_fit(void *bp, size_t asize) {
     size_t csize = GET_SIZE(HDRP(bp));
 
     if ((csize - asize) >= (2 * DSIZE)) {
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(csize-asize, 0));
-        PUT(FTRP(bp), PACK(csize-asize, 0));
+        void *next_bp = NEXT_BLKP(bp);
+        PUT(HDRP(next_bp), PACK(csize - asize, 0));
+        PUT(FTRP(next_bp), PACK(csize - asize, 0));
+
+        next_fit_p = next_bp;
     } else {
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
+
+        next_fit_p = NEXT_BLKP(bp);
     }
 }
